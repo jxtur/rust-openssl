@@ -89,6 +89,9 @@ impl Pkcs12 {
             #[cfg(not(boringssl))]
             mac_md: None,
             ca: None,
+            pkey: None,
+            cert: None,
+            friendly_name: None,
         }
     }
 }
@@ -107,6 +110,9 @@ pub struct Pkcs12Builder {
     #[cfg(not(boringssl))]
     mac_md: Option<MessageDigest>,
     ca: Option<Stack<X509>>,
+    pkey: Option<PKey<Private>>,
+    cert: Option<X509>,
+    friendly_name: Option<CString>,
 }
 
 impl Pkcs12Builder {
@@ -151,6 +157,21 @@ impl Pkcs12Builder {
         self
     }
 
+    pub fn pkey(&mut self, pkey: PKey<Private>) -> &mut Self {
+        self.pkey = Some(pkey);
+        self
+    }
+
+    pub fn cert(&mut self, cert: X509) -> &mut Self {
+        self.cert = Some(cert);
+        self
+    }
+
+    pub fn friendly_name(&mut self, friendly_name: String) -> &mut Self {
+        self.friendly_name = Some(CString::new(friendly_name).unwrap());
+        self
+    }
+
     /// Builds the PKCS #12 object
     ///
     /// # Arguments
@@ -164,8 +185,8 @@ impl Pkcs12Builder {
         self,
         password: &str,
         friendly_name: &str,
-        pkey: Option<&PKeyRef<T>>,
-        cert: Option<&X509Ref>,
+        pkey: &PKeyRef<T>,
+        cert: &X509Ref,
     ) -> Result<Pkcs12, ErrorStack>
     where
         T: HasPrivate,
@@ -173,8 +194,8 @@ impl Pkcs12Builder {
         unsafe {
             let pass = CString::new(password).unwrap();
             let friendly_name = CString::new(friendly_name).unwrap();
-            let pkey = pkey.map_or_else(ptr::null_mut, |k| k.as_ptr());
-            let cert = cert.map_or_else(ptr::null_mut, |c| c.as_ptr());
+            let pkey = pkey.as_ptr();
+            let cert = cert.as_ptr();
             let ca = self
                 .ca
                 .as_ref()
@@ -191,6 +212,74 @@ impl Pkcs12Builder {
             let pkcs12 = cvt_p(ffi::PKCS12_create(
                 pass.as_ptr() as *const _ as *mut _,
                 friendly_name.as_ptr() as *const _ as *mut _,
+                pkey,
+                cert,
+                ca,
+                nid_key,
+                nid_cert,
+                self.iter,
+                self.mac_iter,
+                keytype,
+            ))
+            .map(Pkcs12)?;
+
+            #[cfg(not(boringssl))]
+            // BoringSSL does not support overriding the MAC and will always
+            // use SHA-1
+            {
+                let md_type = self
+                    .mac_md
+                    .map(|md_type| md_type.as_ptr())
+                    .unwrap_or(ptr::null());
+
+                cvt(ffi::PKCS12_set_mac(
+                    pkcs12.as_ptr(),
+                    pass.as_ptr(),
+                    -1,
+                    ptr::null_mut(),
+                    0,
+                    self.mac_iter,
+                    md_type,
+                ))?;
+            }
+
+            Ok(pkcs12)
+        }
+    }
+
+    /// Builds the PKCS #12 object
+    ///
+    /// # Arguments
+    ///
+    /// * `password` - the password used to encrypt the key and certificate
+    /// * `friendly_name` - user defined name for the certificate
+    /// * `pkey` - key to store
+    /// * `cert` - certificate to store
+    #[corresponds(PKCS12_create)]
+    pub fn build2(self, password: &str) -> Result<Pkcs12, ErrorStack> {
+        unsafe {
+            let pass = CString::new(password).unwrap();
+            let friendly_name = self
+                .friendly_name
+                .map_or_else(ptr::null_mut, |n| n.as_ptr() as *const _ as *mut _);
+            let pkey = self.pkey.map_or_else(ptr::null_mut, |k| k.as_ptr());
+            let cert = self.cert.map_or_else(ptr::null_mut, |c| c.as_ptr());
+            let ca = self
+                .ca
+                .as_ref()
+                .map(|ca| ca.as_ptr())
+                .unwrap_or(ptr::null_mut());
+            let nid_key = self.nid_key.as_raw();
+            let nid_cert = self.nid_cert.as_raw();
+
+            // According to the OpenSSL docs, keytype is a non-standard extension for MSIE,
+            // It's values are KEY_SIG or KEY_EX, see the OpenSSL docs for more information:
+            // https://www.openssl.org/docs/man1.0.2/crypto/PKCS12_create.html
+            let keytype = 0;
+
+            let pkcs12 = cvt_p(ffi::PKCS12_create(
+                pass.as_ptr() as *const _ as *mut _,
+                friendly_name,
                 pkey,
                 cert,
                 ca,
@@ -302,10 +391,9 @@ mod test {
         builder.sign(&pkey, MessageDigest::sha256()).unwrap();
         let cert = builder.build();
 
-        let pkcs12_builder = Pkcs12::builder();
-        let pkcs12 = pkcs12_builder
-            .build("mypass", subject_name, Some(&pkey), Some(&cert))
-            .unwrap();
+        let mut pkcs12_builder = Pkcs12::builder();
+        pkcs12_builder.pkey(pkey.clone()).cert(cert.clone());
+        let pkcs12 = pkcs12_builder.build2("mypass").unwrap();
         let der = pkcs12.to_der().unwrap();
 
         let pkcs12 = Pkcs12::from_der(&der).unwrap();
